@@ -499,6 +499,59 @@ class LoadedModel:
             with torch.no_grad():
                 real_model = ipex.optimize(real_model.eval(), inplace=True, graph_mode=True, concat_linear=True)
 
+        if is_intel_xpu() and os.environ.get("_LLM_SCALER_DISABLE_INTERPOLATE_FIX") != "1":
+            def patch_xpu_interpolate_to_cpu():
+                """
+                patches torch.nn.functional.interpolate. If an input tensor is on an XPU device,
+                it will be moved to CPU for interpolation, and the result will be moved back
+                to the original XPU device.
+                """
+                global _original_interpolate_func, _is_interpolate_patched
+
+                if _is_interpolate_patched:
+                    print("torch.nn.functional.interpolate is already patched for XPU. Skipping.")
+                    return
+
+                # Store the original function
+                _original_interpolate_func = F.interpolate
+
+                @functools.wraps(_original_interpolate_func)
+                def _custom_interpolate(input_tensor, *args, **kwargs):
+                    """
+                    Custom wrapper for interpolate. Moves XPU tensors to CPU for computation.
+                    """
+
+                    if input_tensor.device.type == "xpu":
+                        # print(
+                        #     f"Intercepted interpolate call for XPU tensor at device {input_tensor.device}. Moving to CPU for computation."
+                        # )
+                        original_device = input_tensor.device
+
+                        # Move input to CPU
+                        input_on_cpu = input_tensor.to("cpu")
+
+                        # Call the original interpolate function on CPU
+                        result_on_cpu = _original_interpolate_func(input_on_cpu, *args, **kwargs)
+
+                        # Move the result back to the original XPU device
+                        result_on_xpu = result_on_cpu.to(original_device)
+                        # print(
+                        #     f"Interpolation completed on CPU, result moved back to {original_device}."
+                        # )
+                        return result_on_xpu
+                    else:
+                        # If not an XPU tensor, just call the original function directly
+                        return _original_interpolate_func(input_tensor, *args, **kwargs)
+
+                # Replace the original function with our custom one
+                F.interpolate = _custom_interpolate
+                _is_interpolate_patched = True
+                print(
+                    "Successfully patched torch.nn.functional.interpolate to handle XPU tensors on CPU."
+                )
+
+            patch_xpu_interpolate_to_cpu()
+
         self.real_model = weakref.ref(real_model)
         self.model_finalizer = weakref.finalize(real_model, cleanup_models)
         return real_model
@@ -718,7 +771,6 @@ def cleanup_models_gc():
             cur = current_loaded_models[i]
             if cur.is_dead():
                 logging.warning("WARNING, memory leak with model {}. Please make sure it is not being referenced from somewhere.".format(cur.real_model().__class__.__name__))
-
 
 
 def cleanup_models():
@@ -1399,7 +1451,7 @@ def unload_all_models():
     free_memory(1e30, get_torch_device())
 
 
-#TODO: might be cleaner to put this somewhere else
+# TODO: might be cleaner to put this somewhere else
 import threading
 
 class InterruptProcessingException(Exception):
