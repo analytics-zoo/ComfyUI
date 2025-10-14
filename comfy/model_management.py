@@ -499,6 +499,7 @@ class LoadedModel:
             with torch.no_grad():
                 real_model = ipex.optimize(real_model.eval(), inplace=True, graph_mode=True, concat_linear=True)
 
+        import os
         if is_intel_xpu() and os.environ.get("_LLM_SCALER_DISABLE_INTERPOLATE_FIX") != "1":
             def patch_xpu_interpolate_to_cpu():
                 """
