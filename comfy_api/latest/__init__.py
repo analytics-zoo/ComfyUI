@@ -7,7 +7,7 @@ from comfy_api.internal.singleton import ProxiedSingleton
 from comfy_api.internal.async_to_sync import create_sync_class
 from comfy_api.latest._input import ImageInput, AudioInput, MaskInput, LatentInput, VideoInput
 from comfy_api.latest._input_impl import VideoFromFile, VideoFromComponents
-from comfy_api.latest._util import VideoCodec, VideoContainer, VideoComponents
+from comfy_api.latest._util import VideoCodec, VideoContainer, VideoComponents, MESH, VOXEL
 from . import _io as io
 from . import _ui as ui
 # from comfy_api.latest._resources import _RESOURCES as resources  #noqa: F401
@@ -104,6 +104,8 @@ class Types:
     VideoCodec = VideoCodec
     VideoContainer = VideoContainer
     VideoComponents = VideoComponents
+    MESH = MESH
+    VOXEL = VOXEL
 
 ComfyAPI = ComfyAPI_latest
 
@@ -114,7 +116,9 @@ if TYPE_CHECKING:
     ComfyAPISync: Type[comfy_api.latest.generated.ComfyAPISyncStub.ComfyAPISyncStub]
 ComfyAPISync = create_sync_class(ComfyAPI_latest)
 
-comfy_io = io  # create the new alias for io
+# create new aliases for io and ui
+IO = io
+UI = ui
 
 __all__ = [
     "ComfyAPI",
@@ -124,6 +128,7 @@ __all__ = [
     "Types",
     "ComfyExtension",
     "io",
-    "comfy_io",
+    "IO",
     "ui",
+    "UI",
 ]
