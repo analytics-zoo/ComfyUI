@@ -95,6 +95,8 @@ def cast_bias_weight(s, input=None, dtype=None, device=None, bias_dtype=None, of
 
     if offload_stream is not None:
         wf_context = offload_stream
+        if hasattr(wf_context, "as_context"):
+            wf_context = wf_context.as_context(offload_stream)
     else:
         wf_context = contextlib.nullcontext()
 
@@ -117,6 +119,8 @@ def cast_bias_weight(s, input=None, dtype=None, device=None, bias_dtype=None, of
     if weight_has_function or weight.dtype != dtype:
         with wf_context:
             weight = weight.to(dtype=dtype)
+            if isinstance(weight, QuantizedTensor):
+                weight = weight.dequantize()
             for f in s.weight_function:
                 weight = f(weight)
 
@@ -502,7 +506,7 @@ def scaled_fp8_ops(fp8_matrix_mult=False, scale_input=False, override_dtype=None
                     weight *= self.scale_weight.to(device=weight.device, dtype=weight.dtype)
                     return weight
                 else:
-                    return weight * self.scale_weight.to(device=weight.device, dtype=weight.dtype)
+                    return weight.to(dtype=torch.float32) * self.scale_weight.to(device=weight.device, dtype=torch.float32)
 
             def set_weight(self, weight, inplace_update=False, seed=None, return_weight=False, **kwargs):
                 weight = comfy.float.stochastic_rounding(weight / self.scale_weight.to(device=weight.device, dtype=weight.dtype), self.weight.dtype, seed=seed)
@@ -643,14 +647,33 @@ def mixed_precision_ops(layer_quant_config={}, compute_dtype=torch.bfloat16, ful
                     not isinstance(input, QuantizedTensor)):
                     input = QuantizedTensor.from_float(input, self.layout_type, scale=self.input_scale, dtype=self.weight.dtype)
                 return self._forward(input, self.weight, self.bias)
+
+            def convert_weight(self, weight, inplace=False, **kwargs):
+                if isinstance(weight, QuantizedTensor):
+                    return weight.dequantize()
+                else:
+                    return weight
+
+            def set_weight(self, weight, inplace_update=False, seed=None, return_weight=False, **kwargs):
+                if getattr(self, 'layout_type', None) is not None:
+                    weight = QuantizedTensor.from_float(weight, self.layout_type, scale=None, dtype=self.weight.dtype, stochastic_rounding=seed, inplace_ops=True)
+                else:
+                    weight = weight.to(self.weight.dtype)
+                if return_weight:
+                    return weight
+
+                assert inplace_update is False  # TODO: eventually remove the inplace_update stuff
+                self.weight = torch.nn.Parameter(weight, requires_grad=False)
+
     return MixedPrecisionOps
 
 def pick_operations(weight_dtype, compute_dtype, load_device=None, disable_fast_fp8=False, fp8_optimizations=False, scaled_fp8=None, model_config=None):
+    fp8_compute = comfy.model_management.supports_fp8_compute(load_device) # TODO: if we support more ops this needs to be more granular
+
     if model_config and hasattr(model_config, 'layer_quant_config') and model_config.layer_quant_config:
         logging.info(f"Using mixed precision operations: {len(model_config.layer_quant_config)} quantized layers")
-        return mixed_precision_ops(model_config.layer_quant_config, compute_dtype)
+        return mixed_precision_ops(model_config.layer_quant_config, compute_dtype, full_precision_mm=not fp8_compute)
 
-    fp8_compute = comfy.model_management.supports_fp8_compute(load_device)
     if scaled_fp8 is not None:
         return scaled_fp8_ops(fp8_matrix_mult=fp8_compute and fp8_optimizations, scale_input=fp8_optimizations, override_dtype=scaled_fp8)
 
