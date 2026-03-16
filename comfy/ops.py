@@ -16,6 +16,7 @@
     along with this program.  If not, see <https://www.gnu.org/licenses/>.
 """
 
+import os
 import torch
 import logging
 import comfy.model_management
@@ -28,6 +29,45 @@ import comfy.utils
 
 import comfy_aimdo.model_vbar
 import comfy_aimdo.torch
+
+log = logging.getLogger(__name__)
+
+# ---------- omni_xpu_kernel accelerated norm ops ----------
+# Control via env var: OMNI_XPU_KERNEL_DISABLE=1 to disable (default: enabled)
+_omni_norm = None
+_omni_disabled_by_env = os.environ.get("OMNI_XPU_KERNEL_DISABLE", "0") == "1"
+_omni_ops_logged_first_use = False
+
+if _omni_disabled_by_env:
+    log.info("[omni_xpu_kernel] Disabled by environment variable OMNI_XPU_KERNEL_DISABLE=1")
+else:
+    try:
+        from omni_xpu_kernel import norm as _omni_norm
+        log.info("[omni_xpu_kernel] Loaded successfully — accelerated LayerNorm/RMSNorm enabled in ops")
+    except ImportError:
+        log.info("[omni_xpu_kernel] Not installed — using PyTorch native norm ops")
+
+
+def _can_use_omni(x):
+    """Check if input is eligible for omni_xpu_kernel norm acceleration."""
+    if _omni_norm is None:
+        return False
+    if not x.is_xpu:
+        return False
+    if x.ndim < 2:
+        return False
+    hidden_size = x.shape[-1]
+    if hidden_size > 8192 or hidden_size % 32 != 0:
+        return False
+    return True
+
+
+def _log_omni_first_use(op_name, shape):
+    """Log once when omni kernel is first used at runtime."""
+    global _omni_ops_logged_first_use
+    if not _omni_ops_logged_first_use:
+        _omni_ops_logged_first_use = True
+        log.info("[omni_xpu_kernel] First use in ops: %s with shape %s", op_name, shape)
 
 def run_every_op():
     if torch.compiler.is_compiling():
@@ -483,7 +523,13 @@ class disable_weight_init:
                 weight = None
                 bias = None
                 offload_stream = None
-            x = torch.nn.functional.layer_norm(input, self.normalized_shape, weight, bias, self.eps)
+            if _can_use_omni(input) and len(self.normalized_shape) == 1:
+                _log_omni_first_use("LayerNorm", input.shape)
+                orig_shape = input.shape
+                x_2d = input.reshape(-1, orig_shape[-1])
+                x = _omni_norm.layer_norm(x_2d, weight, bias, self.eps).reshape(orig_shape)
+            else:
+                x = torch.nn.functional.layer_norm(input, self.normalized_shape, weight, bias, self.eps)
             uncast_bias_weight(self, weight, bias, offload_stream)
             return x
 
@@ -492,6 +538,14 @@ class disable_weight_init:
             if self.comfy_cast_weights or len(self.weight_function) > 0 or len(self.bias_function) > 0:
                 return self.forward_comfy_cast_weights(*args, **kwargs)
             else:
+                input = args[0] if args else kwargs.get('input')
+                if input is not None and _can_use_omni(input) and len(self.normalized_shape) == 1:
+                    _log_omni_first_use("LayerNorm", input.shape)
+                    orig_shape = input.shape
+                    x_2d = input.reshape(-1, orig_shape[-1])
+                    weight = self.weight
+                    bias = self.bias
+                    return _omni_norm.layer_norm(x_2d, weight, bias, self.eps).reshape(orig_shape)
                 return super().forward(*args, **kwargs)
 
     class RMSNorm(torch.nn.RMSNorm, CastWeightBiasOp):
@@ -506,7 +560,14 @@ class disable_weight_init:
                 weight = None
                 bias = None
                 offload_stream = None
-            x = torch.nn.functional.rms_norm(input, self.normalized_shape, weight, self.eps)
+            if _can_use_omni(input) and weight is not None:
+                _log_omni_first_use("RMSNorm", input.shape)
+                orig_shape = input.shape
+                x_2d = input.reshape(-1, orig_shape[-1])
+                eps = self.eps if self.eps is not None else 1e-6
+                x = _omni_norm.rms_norm(weight, x_2d, eps).reshape(orig_shape)
+            else:
+                x = torch.nn.functional.rms_norm(input, self.normalized_shape, weight, self.eps)
             uncast_bias_weight(self, weight, bias, offload_stream)
             return x
 
@@ -515,6 +576,13 @@ class disable_weight_init:
             if self.comfy_cast_weights or len(self.weight_function) > 0 or len(self.bias_function) > 0:
                 return self.forward_comfy_cast_weights(*args, **kwargs)
             else:
+                input = args[0] if args else kwargs.get('input')
+                if input is not None and _can_use_omni(input) and self.weight is not None:
+                    _log_omni_first_use("RMSNorm", input.shape)
+                    orig_shape = input.shape
+                    x_2d = input.reshape(-1, orig_shape[-1])
+                    eps = self.eps if self.eps is not None else 1e-6
+                    return _omni_norm.rms_norm(self.weight, x_2d, eps).reshape(orig_shape)
                 return super().forward(*args, **kwargs)
 
     class ConvTranspose2d(torch.nn.ConvTranspose2d, CastWeightBiasOp):
