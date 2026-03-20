@@ -296,6 +296,7 @@ class TestXpuFp8Linear(unittest.TestCase):
 
     @unittest.skipUnless(has_xpu(), "XPU not available")
     def test_try_omni_fp8_linear_logs_cached_bad_shape_skip(self):
+        """Cached primitive creation failure logs only at verbose level (COMFY_XPU_FP8_OMNI_LOG=2)."""
         from comfy import xpu_fp8_linear
         from comfy.quant_ops import TensorCoreFP8E4M3Layout
 
@@ -312,10 +313,18 @@ class TestXpuFp8Linear(unittest.TestCase):
         failure_key = xpu_fp8_linear._primitive_failure_cache_key(input_tensor, qweight)
         fake_module = mock.Mock()
 
-        with mock.patch.object(xpu_fp8_linear, "_omni_linear", fake_module):
-            with mock.patch.object(xpu_fp8_linear, "_omni_fp8_failure_cache", {failure_key}):
-                with self.assertLogs(xpu_fp8_linear.log, level="INFO") as logs:
-                    output = xpu_fp8_linear.try_omni_fp8_linear(input_tensor, weight, None)
+        old_val = os.environ.get("COMFY_XPU_FP8_OMNI_LOG")
+        os.environ["COMFY_XPU_FP8_OMNI_LOG"] = "2"
+        try:
+            with mock.patch.object(xpu_fp8_linear, "_omni_linear", fake_module):
+                with mock.patch.object(xpu_fp8_linear, "_omni_fp8_failure_cache", {failure_key}):
+                    with self.assertLogs(xpu_fp8_linear.log, level="INFO") as logs:
+                        output = xpu_fp8_linear.try_omni_fp8_linear(input_tensor, weight, None)
+        finally:
+            if old_val is None:
+                os.environ.pop("COMFY_XPU_FP8_OMNI_LOG", None)
+            else:
+                os.environ["COMFY_XPU_FP8_OMNI_LOG"] = old_val
 
         self.assertIsNone(output)
         fake_module.onednn_w8a16_fp8.assert_not_called()
@@ -323,6 +332,38 @@ class TestXpuFp8Linear(unittest.TestCase):
         self.assertIn("cached primitive creation failure", joined)
         self.assertIn("input_shape=(2, 4)", joined)
         self.assertIn("qdata_shape=(3, 4)", joined)
+
+    @unittest.skipUnless(has_xpu(), "XPU not available")
+    def test_try_omni_fp8_linear_cached_failure_silent_at_default_log_level(self):
+        """At default log level (1), cached primitive creation failures produce no log output."""
+        from comfy import xpu_fp8_linear
+        from comfy.quant_ops import TensorCoreFP8E4M3Layout
+
+        device = torch.device("xpu")
+        input_tensor = torch.randn(2, 4, device=device, dtype=torch.bfloat16)
+        qweight = torch.randn(3, 4, device=device, dtype=torch.float32).to(torch.float8_e4m3fn)
+        weight = FakeQuantizedTensor(
+            qdata=qweight,
+            layout_cls=TensorCoreFP8E4M3Layout,
+            scale=torch.tensor(2.0, device=device, dtype=torch.float32),
+            orig_dtype=torch.bfloat16,
+        )
+
+        failure_key = xpu_fp8_linear._primitive_failure_cache_key(input_tensor, qweight)
+        fake_module = mock.Mock()
+
+        old_val = os.environ.get("COMFY_XPU_FP8_OMNI_LOG")
+        os.environ.pop("COMFY_XPU_FP8_OMNI_LOG", None)
+        try:
+            with mock.patch.object(xpu_fp8_linear, "_omni_linear", fake_module):
+                with mock.patch.object(xpu_fp8_linear, "_omni_fp8_failure_cache", {failure_key}):
+                    output = xpu_fp8_linear.try_omni_fp8_linear(input_tensor, weight, None)
+        finally:
+            if old_val is not None:
+                os.environ["COMFY_XPU_FP8_OMNI_LOG"] = old_val
+
+        self.assertIsNone(output)
+        fake_module.onednn_w8a16_fp8.assert_not_called()
 
     @unittest.skipUnless(has_xpu(), "XPU not available")
     def test_try_omni_fp8_linear_accepts_layout_class_object(self):

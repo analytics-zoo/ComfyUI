@@ -391,7 +391,7 @@ class TestMixedPrecisionOps(unittest.TestCase):
 
     @unittest.skipUnless(has_xpu(), "XPU not available")
     def test_mixed_precision_xpu_forward_logs_fast_path_when_enabled(self):
-        """Test that enabling ComfyUI omni FP8 log env records fast-path use."""
+        """Test that verbose log level (COMFY_XPU_FP8_OMNI_LOG=2) records fast-path hits."""
         from comfy import xpu_fp8_linear
 
         layer_quant_config = {
@@ -424,7 +424,7 @@ class TestMixedPrecisionOps(unittest.TestCase):
         fake_linear = mock.Mock()
         fake_linear.onednn_w8a16_fp8.return_value = torch.ones(5, 20, device="xpu", dtype=torch.bfloat16)
 
-        with mock.patch.dict(os.environ, {"COMFY_XPU_FP8_OMNI_LOG": "1"}, clear=False):
+        with mock.patch.dict(os.environ, {"COMFY_XPU_FP8_OMNI_LOG": "2"}, clear=False):
             with mock.patch.object(xpu_fp8_linear, "_omni_linear", fake_linear):
                 with self.assertLogs("comfy.xpu_fp8_linear", level="INFO") as logs:
                     with torch.inference_mode():
