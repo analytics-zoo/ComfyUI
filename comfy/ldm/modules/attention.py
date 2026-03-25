@@ -810,6 +810,20 @@ def attention_esimd(q, k, v, heads, mask=None, attn_precision=None, skip_reshape
 
     out = _esimd_sdp.sdp(q_blhd, k_blhd, v_blhd)  # [B, L, H, D]
 
+    # NaN detection — remove after debugging
+    if torch.isnan(out).any():
+        nan_count = torch.isnan(out).sum().item()
+        total = out.numel()
+        seq_len = q_blhd.size(1)
+        logging.error(f"[ESIMD SDP] NaN detected! {nan_count}/{total} elements "
+                      f"(call #{_esimd_call_count}, seq={seq_len}, heads={heads}, dtype={q.dtype})")
+        logging.error(f"  input q range: [{q_blhd.min().item():.4f}, {q_blhd.max().item():.4f}]")
+        logging.error(f"  input k range: [{k_blhd.min().item():.4f}, {k_blhd.max().item():.4f}]")
+        # Fallback: recompute with PyTorch SDPA for this call
+        logging.error(f"  falling back to PyTorch SDPA for this call")
+        return attention_pytorch(q, k, v, heads, mask=mask, attn_precision=attn_precision,
+                                 skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
+
     if skip_output_reshape:
         # Return [B, H, L, D]
         return out.permute(0, 2, 1, 3)
