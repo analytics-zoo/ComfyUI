@@ -720,6 +720,104 @@ def attention_flash(q, k, v, heads, mask=None, attn_precision=None, skip_reshape
     return out
 
 
+ESIMD_SDP_IS_AVAILABLE = False
+try:
+    from omni_xpu_kernel._C import sdp as _esimd_sdp
+    ESIMD_SDP_IS_AVAILABLE = True
+    logging.info("ESIMD Flash Attention kernel loaded from omni_xpu_kernel")
+except ImportError:
+    pass
+
+_esimd_call_count = 0
+_esimd_fallback_count = 0
+_esimd_fallback_reasons = {}
+
+def esimd_sdp_stats():
+    """Print ESIMD SDP usage statistics. Call after inference to see if kernel was used."""
+    total = _esimd_call_count + _esimd_fallback_count
+    print(f"\n[ESIMD SDP Stats] total attention calls: {total}")
+    print(f"  ESIMD kernel used: {_esimd_call_count} ({_esimd_call_count*100//max(total,1)}%)")
+    print(f"  fallback to SDPA: {_esimd_fallback_count} ({_esimd_fallback_count*100//max(total,1)}%)")
+    if _esimd_fallback_reasons:
+        print(f"  fallback reasons:")
+        for reason, count in sorted(_esimd_fallback_reasons.items(), key=lambda x: -x[1]):
+            print(f"    {reason}: {count}")
+    return {"esimd": _esimd_call_count, "fallback": _esimd_fallback_count, "reasons": dict(_esimd_fallback_reasons)}
+
+@wrap_attn
+def attention_esimd(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
+    """
+    ESIMD Flash Attention for Intel XPU.
+    Falls back to attention_pytorch when constraints are not met:
+      - B must be 1, head_dim must be 128
+      - dtype must be fp16 or bf16
+      - mask is not supported
+      - device must be XPU
+    """
+    global _esimd_call_count, _esimd_fallback_count
+
+    if skip_reshape:
+        b, _, _, dim_head = q.shape
+    else:
+        b, _, dim_head = q.shape
+        dim_head //= heads
+
+    # Check each condition individually to log fallback reasons
+    reasons = []
+    if not ESIMD_SDP_IS_AVAILABLE:
+        reasons.append("kernel_unavailable")
+    if mask is not None:
+        reasons.append(f"mask={mask.shape}")
+    if b != 1:
+        reasons.append(f"batch={b}")
+    if dim_head != 128:
+        reasons.append(f"dim_head={dim_head}")
+    if q.device.type != "xpu":
+        reasons.append(f"device={q.device.type}")
+    if q.dtype not in (torch.float16, torch.bfloat16):
+        reasons.append(f"dtype={q.dtype}")
+
+    if reasons:
+        _esimd_fallback_count += 1
+        reason_key = ",".join(reasons)
+        _esimd_fallback_reasons[reason_key] = _esimd_fallback_reasons.get(reason_key, 0) + 1
+        if _esimd_fallback_count <= 5:
+            seq_len = q.shape[1] if not skip_reshape else q.shape[2]
+            logging.warning(f"[ESIMD SDP] fallback #{_esimd_fallback_count}: {reason_key} "
+                            f"(shape={list(q.shape)}, heads={heads}, seq={seq_len})")
+        elif _esimd_fallback_count == 6:
+            logging.warning("[ESIMD SDP] suppressing further fallback warnings...")
+        return attention_pytorch(q, k, v, heads, mask=mask, attn_precision=attn_precision,
+                                 skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
+
+    _esimd_call_count += 1
+    if _esimd_call_count <= 3:
+        seq_len = q.shape[1] if not skip_reshape else q.shape[2]
+        logging.info(f"[ESIMD SDP] call #{_esimd_call_count}: heads={heads}, seq={seq_len}, "
+                     f"dtype={q.dtype}, shape={list(q.shape)}")
+
+    # Reshape to [B, L, H, D] for ESIMD kernel
+    if skip_reshape:
+        # Already [B, H, L, D] — permute to [B, L, H, D]
+        q_blhd = q.permute(0, 2, 1, 3).contiguous()
+        k_blhd = k.permute(0, 2, 1, 3).contiguous()
+        v_blhd = v.permute(0, 2, 1, 3).contiguous()
+    else:
+        # [B, L, H*D] -> [B, L, H, D]
+        q_blhd = q.view(b, -1, heads, dim_head).contiguous()
+        k_blhd = k.view(b, -1, heads, dim_head).contiguous()
+        v_blhd = v.view(b, -1, heads, dim_head).contiguous()
+
+    out = _esimd_sdp.sdp(q_blhd, k_blhd, v_blhd)  # [B, L, H, D]
+
+    if skip_output_reshape:
+        # Return [B, H, L, D]
+        return out.permute(0, 2, 1, 3)
+    else:
+        # Return [B, L, H*D]
+        return out.reshape(b, -1, heads * dim_head)
+
+
 optimized_attention = attention_basic
 
 if model_management.sage_attention_enabled():
@@ -732,8 +830,12 @@ elif model_management.flash_attention_enabled():
     logging.info("Using Flash Attention")
     optimized_attention = attention_flash
 elif model_management.pytorch_attention_enabled():
-    logging.info("Using pytorch attention")
-    optimized_attention = attention_pytorch
+    if ESIMD_SDP_IS_AVAILABLE:
+        logging.info("Using ESIMD Flash Attention (with pytorch fallback)")
+        optimized_attention = attention_esimd
+    else:
+        logging.info("Using pytorch attention")
+        optimized_attention = attention_pytorch
 else:
     if args.use_split_cross_attention:
         logging.info("Using split optimization for attention")
