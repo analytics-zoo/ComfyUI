@@ -31,17 +31,28 @@ def _can_use_omni_rope(x):
 def _omni_apply_rope1(x: Tensor, freqs_cis: Tensor):
     """Apply RoPE using omni_xpu_kernel ESIMD rotary kernel."""
     global _omni_rotary_logged
+
+    # x: [B, H, S, D], freqs_cis: [B, 1, S_freq, D/2, 2, 2]
+    B, H, S, D = x.shape
+    S_freq = freqs_cis.shape[2]
+
+    # Fallback to vanilla implementation if freqs seq_len < x seq_len
+    if S_freq < S:
+        x_ = x.to(dtype=freqs_cis.dtype).reshape(*x.shape[:-1], -1, 1, 2)
+        if x_.shape[2] != 1 and freqs_cis.shape[2] != 1 and x_.shape[2] != freqs_cis.shape[2]:
+            freqs_cis = freqs_cis[:, :, :x_.shape[2]]
+        x_out = freqs_cis[..., 0] * x_[..., 0]
+        x_out.addcmul_(freqs_cis[..., 1], x_[..., 1])
+        return x_out.reshape(*x.shape).type_as(x)
+
     if not _omni_rotary_logged:
         _omni_rotary_logged = True
         logging.info("[omni_xpu_kernel] First use of ESIMD rotary_emb with shape %s", x.shape)
 
-    # x: [B, H, S, D], freqs_cis: [B, 1, S, D/2, 2, 2]
-    B, H, S, D = x.shape
-
-    # Extract cos/sin from rotation matrix pe
+    # Extract cos/sin from rotation matrix pe, truncated to actual seq_len S
     # pe[..., 0, 0] = cos, pe[..., 1, 0] = sin
-    cos_cache = freqs_cis[0, 0, :, :, 0, 0].contiguous()  # [S, D/2]
-    sin_cache = freqs_cis[0, 0, :, :, 1, 0].contiguous()  # [S, D/2]
+    cos_cache = freqs_cis[0, 0, :S, :, 0, 0].to(dtype=torch.float32).contiguous()  # [S, D/2]
+    sin_cache = freqs_cis[0, 0, :S, :, 1, 0].to(dtype=torch.float32).contiguous()  # [S, D/2]
 
     # Reshape: [B, H, S, D] -> [B, S, H, D] -> [B*S*H, D]
     x_flat = x.permute(0, 2, 1, 3).contiguous().reshape(B * S * H, D)

@@ -720,6 +720,133 @@ def attention_flash(q, k, v, heads, mask=None, attn_precision=None, skip_reshape
     return out
 
 
+# ESIMD Flash Attention — controlled by COMFYUI_ESIMD_SDP env var (default: enabled)
+# Set COMFYUI_ESIMD_SDP=0 to disable ESIMD and use PyTorch SDPA instead.
+import os as _os
+
+ESIMD_SDP_IS_AVAILABLE = False
+_esimd_sdp_enabled = _os.environ.get("COMFYUI_ESIMD_SDP", "1") != "0"
+
+if _esimd_sdp_enabled:
+    try:
+        from omni_xpu_kernel._C import sdp as _esimd_sdp
+        ESIMD_SDP_IS_AVAILABLE = True
+        logging.info("ESIMD Flash Attention kernel loaded from omni_xpu_kernel")
+    except ImportError:
+        logging.info("omni_xpu_kernel not available, ESIMD SDP disabled")
+else:
+    logging.info("ESIMD SDP disabled via COMFYUI_ESIMD_SDP=0")
+
+_esimd_call_count = 0
+_esimd_fallback_count = 0
+_esimd_fallback_reasons = {}
+
+def esimd_sdp_stats():
+    """Print ESIMD SDP usage statistics."""
+    total = _esimd_call_count + _esimd_fallback_count
+    if total == 0:
+        return {"esimd": 0, "fallback": 0, "reasons": {}}
+    logging.info(f"[ESIMD SDP Stats] total={total}, esimd={_esimd_call_count} "
+                 f"({_esimd_call_count*100//max(total,1)}%), fallback={_esimd_fallback_count}")
+    if _esimd_fallback_reasons:
+        for reason, count in sorted(_esimd_fallback_reasons.items(), key=lambda x: -x[1]):
+            logging.info(f"  {reason}: {count}")
+    return {"esimd": _esimd_call_count, "fallback": _esimd_fallback_count, "reasons": dict(_esimd_fallback_reasons)}
+
+@wrap_attn
+def attention_esimd(q, k, v, heads, mask=None, attn_precision=None, skip_reshape=False, skip_output_reshape=False, **kwargs):
+    """
+    ESIMD Flash Attention for Intel XPU (Xe2 ISA).
+
+    Uses pre-compiled ESIMD kernel (lgrf_sdp.so) with automatic PyTorch SDPA fallback.
+    The kernel includes per-head V-scaling (prevents fp16 accumulator overflow) and
+    fp32 online-softmax compensation (prevents compensation overflow).
+
+    Control:
+      COMFYUI_ESIMD_SDP=0  — disable ESIMD, use PyTorch SDPA
+      COMFYUI_ESIMD_SDP=1  — enable ESIMD (default)
+
+    Fallback to PyTorch SDPA when:
+      - B != 1, head_dim != 128, mask != None, device != XPU, dtype not fp16/bf16
+      - Kernel output contains non-finite values (safety net)
+    """
+    global _esimd_call_count, _esimd_fallback_count
+
+    if skip_reshape:
+        b, _, _, dim_head = q.shape
+    else:
+        b, _, dim_head = q.shape
+        dim_head //= heads
+
+    # Shape/dtype constraint check — fallback with reason logging
+    reasons = []
+    if not ESIMD_SDP_IS_AVAILABLE:
+        reasons.append("kernel_unavailable")
+    if b != 1:
+        reasons.append(f"batch={b}")
+    if mask is not None:
+        reasons.append(f"mask={mask.shape}")
+    if dim_head not in (64, 128):
+        reasons.append(f"dim_head={dim_head}")
+    if q.device.type != "xpu":
+        reasons.append(f"device={q.device.type}")
+    if q.dtype not in (torch.float16, torch.bfloat16):
+        reasons.append(f"dtype={q.dtype}")
+
+    if reasons:
+        _esimd_fallback_count += 1
+        reason_key = ",".join(reasons)
+        _esimd_fallback_reasons[reason_key] = _esimd_fallback_reasons.get(reason_key, 0) + 1
+        if _esimd_fallback_count <= 5:
+            seq_len = q.shape[1] if not skip_reshape else q.shape[2]
+            logging.info(f"[ESIMD SDP] fallback: {reason_key} (seq={seq_len}, heads={heads})")
+        elif _esimd_fallback_count == 6:
+            logging.info("[ESIMD SDP] suppressing further fallback logs")
+        return attention_pytorch(q, k, v, heads, mask=mask, attn_precision=attn_precision,
+                                 skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
+
+    _esimd_call_count += 1
+    if _esimd_call_count <= 3:
+        seq_len = q.shape[1] if not skip_reshape else q.shape[2]
+        logging.info(f"[ESIMD SDP] call #{_esimd_call_count}: heads={heads}, seq={seq_len}, "
+                     f"dtype={q.dtype}, shape={list(q.shape)}")
+
+    # Reshape to [B, L, H, D] for ESIMD kernel
+    if skip_reshape:
+        q_blhd = q.permute(0, 2, 1, 3).contiguous()
+        k_blhd = k.permute(0, 2, 1, 3).contiguous()
+        v_blhd = v.permute(0, 2, 1, 3).contiguous()
+    else:
+        q_blhd = q.view(b, -1, heads, dim_head).contiguous()
+        k_blhd = k.view(b, -1, heads, dim_head).contiguous()
+        v_blhd = v.view(b, -1, heads, dim_head).contiguous()
+
+    # Kernel handles per-head V-scaling internally (C++ sdp.cpp)
+    out = _esimd_sdp.sdp(q_blhd, k_blhd, v_blhd)
+
+    # Output validation — safety net for any remaining numerical edge cases
+    if not torch.isfinite(out).all():
+        _esimd_fallback_count += 1
+        _esimd_fallback_reasons["output_non_finite"] = _esimd_fallback_reasons.get("output_non_finite", 0) + 1
+        bad_count = _esimd_fallback_reasons["output_non_finite"]
+        if bad_count <= 3:
+            inf_c = torch.isinf(out).sum().item()
+            nan_c = torch.isnan(out).sum().item()
+            logging.warning(f"[ESIMD SDP] Non-finite output (call #{_esimd_call_count}): "
+                          f"inf={inf_c}, nan={nan_c} / {out.numel()}")
+            logging.warning(f"  V range: [{v_blhd.min().item():.1f}, {v_blhd.max().item():.1f}], "
+                          f"falling back to PyTorch SDPA")
+        elif bad_count == 4:
+            logging.warning("[ESIMD SDP] Sustained non-finite output, suppressing further warnings")
+        return attention_pytorch(q, k, v, heads, mask=mask, attn_precision=attn_precision,
+                                 skip_reshape=skip_reshape, skip_output_reshape=skip_output_reshape, **kwargs)
+
+    if skip_output_reshape:
+        return out.permute(0, 2, 1, 3)
+    else:
+        return out.reshape(b, -1, heads * dim_head)
+
+
 optimized_attention = attention_basic
 
 if model_management.sage_attention_enabled():
@@ -732,8 +859,13 @@ elif model_management.flash_attention_enabled():
     logging.info("Using Flash Attention")
     optimized_attention = attention_flash
 elif model_management.pytorch_attention_enabled():
-    logging.info("Using pytorch attention")
-    optimized_attention = attention_pytorch
+    if ESIMD_SDP_IS_AVAILABLE:
+        logging.info("Using ESIMD Flash Attention (with pytorch fallback)")
+        logging.info("  Control: set COMFYUI_ESIMD_SDP=0 to disable")
+        optimized_attention = attention_esimd
+    else:
+        logging.info("Using pytorch attention")
+        optimized_attention = attention_pytorch
 else:
     if args.use_split_cross_attention:
         logging.info("Using split optimization for attention")
