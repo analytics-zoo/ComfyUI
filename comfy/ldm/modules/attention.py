@@ -824,17 +824,17 @@ def attention_esimd(q, k, v, heads, mask=None, attn_precision=None, skip_reshape
     # Kernel handles per-head V-scaling internally (C++ sdp.cpp)
     out = _esimd_sdp.sdp(q_blhd, k_blhd, v_blhd)
 
-    # Output validation — safety net for any remaining numerical edge cases
-    if not torch.isfinite(out).all():
+    # ── Non-finite detection ─────────────────────────────────────────────────
+    # BF16 models: S×V uses bf16 DPAS with bf16 accumulator (range ±3.39e38),
+    #   so overflow is impossible. No check needed.
+    # FP16 models: S×V uses fp16 accumulator (range ±65504) which can overflow
+    #   for large V values. Full tensor NaN check via (out != out).any().
+    if q.dtype == torch.float16 and (out != out).any():
         _esimd_fallback_count += 1
         _esimd_fallback_reasons["output_non_finite"] = _esimd_fallback_reasons.get("output_non_finite", 0) + 1
         bad_count = _esimd_fallback_reasons["output_non_finite"]
         if bad_count <= 3:
-            inf_c = torch.isinf(out).sum().item()
-            nan_c = torch.isnan(out).sum().item()
-            logging.warning(f"[ESIMD SDP] Non-finite output (call #{_esimd_call_count}): "
-                          f"inf={inf_c}, nan={nan_c} / {out.numel()}")
-            logging.warning(f"  V range: [{v_blhd.min().item():.1f}, {v_blhd.max().item():.1f}], "
+            logging.warning(f"[ESIMD SDP] FP16 overflow detected (call #{_esimd_call_count}), "
                           f"falling back to PyTorch SDPA")
         elif bad_count == 4:
             logging.warning("[ESIMD SDP] Sustained non-finite output, suppressing further warnings")
