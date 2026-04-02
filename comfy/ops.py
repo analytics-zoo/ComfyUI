@@ -1109,10 +1109,12 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                             w = self.weight
                             fp8_dtype = torch.float8_e4m3fn if self.quant_format == 'float8_e4m3fn' else torch.float8_e5m2
                             if isinstance(w, QuantizedTensor):
-                                # QuantizedTensor stores FP8 data; view underlying storage as FP8
-                                w_fp8 = w.view(fp8_dtype)
-                                p = getattr(w, 'params', None)
-                                scale_w = getattr(p, 'scale', None) if p else None
+                                # QuantizedTensor._qdata is the underlying FP8 storage.
+                                # Do NOT use w.view(fp8_dtype) — that reinterprets the
+                                # logical dtype (bf16/fp16, 2 bytes) as fp8 (1 byte),
+                                # doubling the K dimension.
+                                w_fp8 = w._qdata
+                                scale_w = getattr(w.params, 'scale', None)
                             else:
                                 w_fp8 = w if w.dtype == fp8_dtype else w.view(fp8_dtype)
                                 scale_w = getattr(self, 'scale_weight', None)
