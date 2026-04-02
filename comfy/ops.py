@@ -523,7 +523,8 @@ class disable_weight_init:
                 weight = None
                 bias = None
                 offload_stream = None
-            if _can_use_omni(input) and len(self.normalized_shape) == 1:
+            if (_can_use_omni(input) and len(self.normalized_shape) == 1
+                    and (weight is None or weight.shape[0] == input.shape[-1])):
                 _log_omni_first_use("LayerNorm", input.shape)
                 orig_shape = input.shape
                 x_2d = input.reshape(-1, orig_shape[-1])
@@ -539,7 +540,8 @@ class disable_weight_init:
                 return self.forward_comfy_cast_weights(*args, **kwargs)
             else:
                 input = args[0] if args else kwargs.get('input')
-                if input is not None and _can_use_omni(input) and len(self.normalized_shape) == 1:
+                if (input is not None and _can_use_omni(input) and len(self.normalized_shape) == 1
+                        and (self.weight is None or self.weight.shape[0] == input.shape[-1])):
                     _log_omni_first_use("LayerNorm", input.shape)
                     orig_shape = input.shape
                     x_2d = input.reshape(-1, orig_shape[-1])
@@ -560,7 +562,7 @@ class disable_weight_init:
                 weight = None
                 bias = None
                 offload_stream = None
-            if _can_use_omni(input) and weight is not None:
+            if _can_use_omni(input) and weight is not None and weight.shape[0] == input.shape[-1]:
                 _log_omni_first_use("RMSNorm", input.shape)
                 orig_shape = input.shape
                 x_2d = input.reshape(-1, orig_shape[-1])
@@ -577,7 +579,7 @@ class disable_weight_init:
                 return self.forward_comfy_cast_weights(*args, **kwargs)
             else:
                 input = args[0] if args else kwargs.get('input')
-                if input is not None and _can_use_omni(input) and self.weight is not None:
+                if input is not None and _can_use_omni(input) and self.weight is not None and self.weight.shape[0] == input.shape[-1]:
                     _log_omni_first_use("RMSNorm", input.shape)
                     orig_shape = input.shape
                     x_2d = input.reshape(-1, orig_shape[-1])
@@ -746,13 +748,31 @@ class manual_cast(disable_weight_init):
         comfy_cast_weights = True
 
 
+# ---------- omni_xpu_kernel FP8 GEMM acceleration ----------
+# Uses oneDNN W8A16 FP8 GEMM when available on XPU. Supports E4M3 and E5M2 weight formats.
+# Set COMFYUI_FP8_GEMM=0 to disable and use the original QuantizedTensor dispatch path.
+_omni_fp8_linear = None
+_omni_fp8_logged_first_use = False
+_omni_fp8_enabled = os.environ.get("COMFYUI_FP8_GEMM", "1") != "0"
+if _omni_fp8_enabled:
+    try:
+        from omni_xpu_kernel import linear as _omni_linear_mod
+        _omni_fp8_linear = _omni_linear_mod.onednn_w8a16_fp8
+        log.info("[omni_xpu_kernel] FP8 GEMM (oneDNN W8A16) loaded — accelerated FP8 linear enabled")
+        log.info("  Control: set COMFYUI_FP8_GEMM=0 to disable")
+    except ImportError:
+        pass
+else:
+    log.info("omni_xpu_kernel FP8 GEMM disabled via COMFYUI_FP8_GEMM=0")
+
 def fp8_linear(self, input):
     """
-    Legacy FP8 linear function for backward compatibility.
-    Uses QuantizedTensor subclass for dispatch.
+    FP8 linear function. Uses omni_xpu_kernel oneDNN W8A16 when available on XPU,
+    falls back to original QuantizedTensor dispatch otherwise.
+    Supports float8_e4m3fn and float8_e5m2 weight dtypes.
     """
     dtype = self.weight.dtype
-    if dtype not in [torch.float8_e4m3fn]:
+    if dtype not in [torch.float8_e4m3fn, torch.float8_e5m2]:
         return None
 
     input_dtype = input.dtype
@@ -764,10 +784,28 @@ def fp8_linear(self, input):
 
     if input.ndim != 2:
         return None
-    lora_compute_dtype=comfy.model_management.lora_compute_dtype(input.device)
-    w, bias, offload_stream = cast_bias_weight(self, input, dtype=dtype, bias_dtype=input_dtype, offloadable=True, compute_dtype=lora_compute_dtype, want_requant=True)
-    scale_weight = torch.ones((), device=input.device, dtype=torch.float32)
 
+    lora_compute_dtype = comfy.model_management.lora_compute_dtype(input.device)
+    w, bias, offload_stream = cast_bias_weight(self, input, dtype=dtype, bias_dtype=input_dtype, offloadable=True, compute_dtype=lora_compute_dtype, want_requant=True)
+
+    # --- omni_xpu_kernel oneDNN FP8 GEMM (fast path for XPU) ---
+    if _omni_fp8_linear is not None and input.is_xpu:
+        global _omni_fp8_logged_first_use
+        if not _omni_fp8_logged_first_use:
+            _omni_fp8_logged_first_use = True
+            log.info(f"[omni_xpu_kernel] First use of FP8 GEMM: input={list(input.shape)} weight={list(w.shape)} dtype={dtype}")
+        scale_weight = self.scale_weight if hasattr(self, 'scale_weight') and self.scale_weight is not None else torch.ones((), device=input.device, dtype=torch.float32)
+        try:
+            o = _omni_fp8_linear(input, w, scale_weight, bias)
+            uncast_bias_weight(self, w, bias, offload_stream)
+            if tensor_3d:
+                o = o.reshape((input_shape[0], input_shape[1], w.shape[0]))
+            return o
+        except Exception as e:
+            log.info(f"[omni_xpu_kernel] FP8 GEMM failed, falling back: {e}")
+
+    # --- Original path: QuantizedTensor dispatch (kept for non-XPU and fallback) ---
+    scale_weight = torch.ones((), device=input.device, dtype=torch.float32)
     scale_input = torch.ones((), device=input.device, dtype=torch.float32)
     input = torch.clamp(input, min=-448, max=448, out=input)
     input_fp8 = input.to(dtype).contiguous()
@@ -1022,6 +1060,27 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                 return sd
 
             def _forward(self, input, weight, bias):
+                # omni_xpu_kernel FP8 GEMM fast path: intercept when raw FP8 weight is available
+                # After cast_bias_weight(), FP8 QuantizedTensor may be dequantized or remain FP8.
+                # Check the actual tensor dtype to decide.
+                if (_omni_fp8_linear is not None and input.is_xpu and input.ndim == 2 and
+                    hasattr(weight, 'dtype') and weight.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)):
+                    global _omni_fp8_logged_first_use
+                    if not _omni_fp8_logged_first_use:
+                        _omni_fp8_logged_first_use = True
+                        log.info(f"[omni_xpu_kernel] First use of FP8 GEMM: input={list(input.shape)} "
+                                 f"weight={list(weight.shape)} dtype={weight.dtype}")
+                    try:
+                        scale_w = getattr(self, 'scale_weight', None)
+                        if scale_w is None:
+                            p = getattr(self.weight, 'params', None) or getattr(self.weight, '_layout_params', None)
+                            scale_w = getattr(p, 'scale', None) if p else None
+                        if scale_w is None:
+                            scale_w = torch.ones((), device=input.device, dtype=torch.float32)
+                        return _omni_fp8_linear(input, weight, scale_w, bias)
+                    except Exception as e:
+                        log.info(f"[omni_xpu_kernel] FP8 GEMM failed in MixedPrecisionOps, falling back: {e}")
+                # Original path: F.linear (QuantizedTensor dispatch or native)
                 return torch.nn.functional.linear(input, weight, bias)
 
             def forward_comfy_cast_weights(self, input, compute_dtype=None, want_requant=False):
@@ -1033,6 +1092,51 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
             def forward(self, input, *args, **kwargs):
                 run_every_op()
 
+                # --- omni_xpu_kernel FP8 GEMM fast path for XPU ---
+                # Intercept before comfy_kitchen QuantizedTensor dispatch.
+                # On XPU with FP8 weights, directly call oneDNN W8A16 GEMM.
+                # The weight is stored as QuantizedTensor wrapping FP8 data.
+                # We extract the raw FP8 tensor via storage_dtype and view_as.
+                if (_omni_fp8_linear is not None and input.is_xpu and
+                    getattr(self, 'quant_format', None) in ('float8_e4m3fn', 'float8_e5m2') and
+                    len(self.weight_function) == 0 and len(self.bias_function) == 0):
+                    global _omni_fp8_logged_first_use
+                    input_shape = input.shape
+                    input_2d = input.reshape(-1, input_shape[-1]) if input.ndim == 3 else input
+                    if input_2d.ndim == 2:
+                        try:
+                            # Extract raw FP8 weight from QuantizedTensor
+                            w = self.weight
+                            fp8_dtype = torch.float8_e4m3fn if self.quant_format == 'float8_e4m3fn' else torch.float8_e5m2
+                            if isinstance(w, QuantizedTensor):
+                                # QuantizedTensor stores FP8 data; view underlying storage as FP8
+                                w_fp8 = w.view(fp8_dtype)
+                                p = getattr(w, 'params', None)
+                                scale_w = getattr(p, 'scale', None) if p else None
+                            else:
+                                w_fp8 = w if w.dtype == fp8_dtype else w.view(fp8_dtype)
+                                scale_w = getattr(self, 'scale_weight', None)
+                            if scale_w is None:
+                                scale_w = torch.ones((), device=input.device, dtype=torch.float32)
+                            scale_w = comfy.model_management.cast_to_device(scale_w, input.device, torch.float32)
+                            w_fp8 = comfy.model_management.cast_to_device(w_fp8, input.device, None)
+                            bias = comfy.model_management.cast_to_device(self.bias, input.device, input.dtype) if self.bias is not None else None
+
+                            if not _omni_fp8_logged_first_use:
+                                _omni_fp8_logged_first_use = True
+                                log.info(f"[omni_xpu_kernel] First use of FP8 GEMM: input={list(input_2d.shape)} "
+                                         f"weight={list(w_fp8.shape)} dtype={w_fp8.dtype} format={self.quant_format}")
+
+                            o = _omni_fp8_linear(input_2d, w_fp8, scale_w, bias)
+                            if input.ndim == 3:
+                                o = o.reshape(input_shape[0], input_shape[1], -1)
+                            return o
+                        except Exception as e:
+                            if not _omni_fp8_logged_first_use:
+                                _omni_fp8_logged_first_use = True
+                                log.info(f"[omni_xpu_kernel] FP8 GEMM failed, using comfy_kitchen path: {e}")
+
+                # --- Original comfy_kitchen path ---
                 input_shape = input.shape
                 reshaped_3d = False
                 #If cast needs to apply lora, it should be done in the compute dtype
