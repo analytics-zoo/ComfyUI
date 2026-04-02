@@ -1096,7 +1096,7 @@ def mixed_precision_ops(quant_config={}, compute_dtype=torch.bfloat16, full_prec
                 # Intercept before comfy_kitchen QuantizedTensor dispatch.
                 # On XPU with FP8 weights, directly call oneDNN W8A16 GEMM.
                 # The weight is stored as QuantizedTensor wrapping FP8 data.
-                # We extract the raw FP8 tensor via storage_dtype and view_as.
+                # We extract the raw FP8 tensor via _qdata.
                 if (_omni_fp8_linear is not None and input.is_xpu and
                     getattr(self, 'quant_format', None) in ('float8_e4m3fn', 'float8_e5m2') and
                     len(self.weight_function) == 0 and len(self.bias_function) == 0):
