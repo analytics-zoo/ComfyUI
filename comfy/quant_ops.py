@@ -40,6 +40,11 @@ except ImportError as e:
     def register_layout_class(name, cls):
         pass
 
+    def register_layout_op(op, cls):
+        def decorator(func):
+            return func
+        return decorator
+
     def get_layout_class(name):
         return None
 
@@ -219,3 +224,9 @@ __all__ = [
     "QUANT_ALGOS",
     "register_layout_op",
 ]
+
+
+try:
+    import comfy.xpu_quant_layout_ops  # noqa: F401
+except ImportError:
+    pass
